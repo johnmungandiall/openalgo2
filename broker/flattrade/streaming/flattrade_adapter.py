@@ -38,8 +38,11 @@ from .flattrade_websocket import FlattradeWebSocket
 
 # Configuration constants
 class Config:
-    MAX_RECONNECT_ATTEMPTS = 10
-    BASE_RECONNECT_DELAY = 5
+    # 2s (was 5s): every drop is a blind window on the customer's chart, and
+    # the peer is a single broker endpoint - not a shared herd - so a tight
+    # first retry costs nothing and halves the freeze.
+    MAX_RECONNECT_ATTEMPTS = 50
+    BASE_RECONNECT_DELAY = 2
     MAX_RECONNECT_DELAY = 60
     CACHE_COMPLETENESS_THRESHOLD = 0.3
     WEBSOCKET_TIMEOUT = 30
@@ -347,6 +350,13 @@ class FlattradeWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.reconnect_attempts = 0
         self._reconnect_timer = None  # Track reconnection timer for cleanup
 
+        # Generation counter for the ws client. Incremented every time the
+        # current client is RETIRED (reconnect / shutdown) so callbacks arriving
+        # from the retired socket - which fire synchronously inside stop() and
+        # again from its own reader thread, i.e. after the replacement is already
+        # connected - can be ignored. See _is_current().
+        self._client_generation = 0
+
         # Auth-failure retry counter - deliberately SEPARATE from and much
         # tighter-bounded than reconnect_attempts/Config.MAX_RECONNECT_ATTEMPTS
         # above, which are for ordinary network drops. This gives the daily
@@ -398,15 +408,7 @@ class FlattradeWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.logger.info(f"Using Flattrade credentials - User ID: {self.actid}")
 
         # Initialize WebSocket client
-        self.ws_client = FlattradeWebSocket(
-            user_id=self.actid,
-            actid=self.actid,
-            accesstoken=self.accesstoken,
-            on_message=self._on_message,
-            on_error=self._on_error,
-            on_close=self._on_close,
-            on_open=self._on_open,
-        )
+        self.ws_client = self._build_ws_client()
 
         self.running = True
 
@@ -446,8 +448,7 @@ class FlattradeWebSocketAdapter(BaseBrokerWebSocketAdapter):
             self.subscription_queue.clear()
 
             if self.ws_client:
-                self.ws_client.stop()
-                self.ws_client = None
+                self._retire_client()
 
         # Clean up market data cache (outside lock - has its own lock)
         self.market_cache.clear()
@@ -884,6 +885,68 @@ class FlattradeWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
         self._schedule_reconnection()
 
+    def _build_ws_client(self) -> FlattradeWebSocket:
+        """Build a WebSocket client whose callbacks are bound to this generation.
+
+        Every callback is wrapped so it is dropped once its generation is no
+        longer current (see [_is_current] and [_retire_client]).
+
+        Why this matters: a socket we retire can still deliver on_close /
+        on_error from its own thread - and stop() delivers them *synchronously*
+        while the replacement is being built. Routed in unfiltered, such a
+        callback sets `connected = False` on a healthy connection and, worst of
+        all, calls `_schedule_reconnection()`, whose timer then tears down the
+        HEALTHY replacement - whose retirement fires another on_close, and so on.
+        That feedback loop turned a single drop into a permanent ~10s
+        kill-and-reconnect cycle: 430 self-inflicted closes in one trading
+        session, with the market-data socket alive only in 5-second slices (the
+        customer's "chart freezes then jumps").
+        """
+        generation = self._client_generation
+        return FlattradeWebSocket(
+            user_id=self.actid,
+            actid=self.actid,
+            accesstoken=self.accesstoken,
+            on_message=lambda ws, msg: (
+                self._on_message(ws, msg) if self._is_current(generation) else None
+            ),
+            on_error=lambda ws, err: (
+                self._on_error(ws, err) if self._is_current(generation) else None
+            ),
+            on_close=lambda ws, code, msg: (
+                self._on_close(ws, code, msg) if self._is_current(generation) else None
+            ),
+            on_open=lambda ws: (self._on_open(ws) if self._is_current(generation) else None),
+        )
+
+    def _is_current(self, generation: int) -> bool:
+        """True while [generation] is still the live client generation."""
+        if generation == self._client_generation:
+            return True
+        self.logger.debug(
+            f"Ignoring callback from retired WebSocket client "
+            f"(generation {generation}, current {self._client_generation})"
+        )
+        return False
+
+    def _retire_client(self) -> None:
+        """Retire the current ws client and stop it.
+
+        The generation is bumped BEFORE stop(): stop() fires the socket's own
+        on_close synchronously, and doing it in the other order would let that
+        callback schedule a reconnect for the client we are about to replace.
+        Caller may hold self.lock (both call sites do).
+        """
+        self._client_generation += 1
+        client = self.ws_client
+        self.ws_client = None
+        if not client:
+            return
+        try:
+            client.stop()
+        except Exception as cleanup_err:
+            self.logger.warning(f"Error cleaning up old WebSocket: {cleanup_err}")
+
     def _schedule_reconnection(self) -> None:
         """Schedule reconnection with exponential backoff"""
         # Use lock to prevent race with disconnect()
@@ -928,14 +991,11 @@ class FlattradeWebSocketAdapter(BaseBrokerWebSocketAdapter):
             self.reconnect_attempts += 1
 
             try:
-                # CRITICAL: Clean up old WebSocket client to prevent FD leaks
-                if self.ws_client:
-                    self.logger.debug("Cleaning up old WebSocket client before reconnection")
-                    try:
-                        self.ws_client.stop()
-                    except Exception as cleanup_err:
-                        self.logger.warning(f"Error cleaning up old WebSocket: {cleanup_err}")
-                    self.ws_client = None
+                # CRITICAL: Clean up old WebSocket client to prevent FD leaks.
+                # _retire_client() bumps the generation first, so the outgoing
+                # socket's on_close/on_error can no longer schedule another
+                # reconnect behind our back.
+                self._retire_client()
 
                 # Re-read fresh auth token from database before reconnecting.
                 # Flattrade tokens roll over daily at ~3 AM IST; reusing the
@@ -949,15 +1009,7 @@ class FlattradeWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     )
 
                 # Recreate WebSocket client
-                self.ws_client = FlattradeWebSocket(
-                    user_id=self.actid,
-                    actid=self.actid,
-                    accesstoken=self.accesstoken,
-                    on_message=self._on_message,
-                    on_error=self._on_error,
-                    on_close=self._on_close,
-                    on_open=self._on_open,
-                )
+                self.ws_client = self._build_ws_client()
 
                 if self.ws_client.connect():
                     self.connected = True
